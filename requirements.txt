@@ -1,0 +1,10 @@
+# 员工花名册统计系统 - Python 依赖
+# 安装：pip install -r requirements.txt
+
+PySide6==6.12.0
+openpyxl==3.1.5
+python-pptx==1.0.2
+pdfplumber==0.11.10
+xlrd==2.0.2
+
+# 说明：老版 .ppt 导入依赖本机安装 LibreOffice（用于自动转 pptx）
