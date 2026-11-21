@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass, fields
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -128,6 +128,19 @@ class Database:
                 conn.execute("ALTER TABLE employees ADD COLUMN is_departed INTEGER DEFAULT 0")
             if "leave_date" not in existing:
                 conn.execute("ALTER TABLE employees ADD COLUMN leave_date TEXT")
+
+            # 操作历史表
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS operation_log (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts         TEXT NOT NULL,
+                    action     TEXT NOT NULL,
+                    target     TEXT NOT NULL,
+                    detail     TEXT
+                )
+                """
+            )
 
     @staticmethod
     def _row_to_employee(row: sqlite3.Row) -> Employee:
@@ -273,3 +286,53 @@ class Database:
                 (department,),
             ).fetchall()
         return [self._row_to_employee(r) for r in rows]
+
+    # ---------- 批量操作 ----------
+    def delete_many(self, employee_ids: list[int]) -> int:
+        """批量删除，返回实际删除条数。"""
+        if not employee_ids:
+            return 0
+        with self._connect() as conn:
+            placeholders = ",".join("?" for _ in employee_ids)
+            cur = conn.execute(
+                f"DELETE FROM employees WHERE id IN ({placeholders})",
+                employee_ids,
+            )
+            return cur.rowcount
+
+    def set_department_many(self, employee_ids: list[int], department: str) -> int:
+        """批量调整部门，返回更新条数。"""
+        if not employee_ids:
+            return 0
+        with self._connect() as conn:
+            placeholders = ",".join("?" for _ in employee_ids)
+            cur = conn.execute(
+                f"UPDATE employees SET department=? WHERE id IN ({placeholders})",
+                [department, *employee_ids],
+            )
+            return cur.rowcount
+
+    # ---------- 操作历史 ----------
+    def add_log(self, action: str, target: str, detail: str = "") -> None:
+        """记录一次操作。"""
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO operation_log (ts, action, target, detail) VALUES (?,?,?,?)",
+                (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), action, target, detail),
+            )
+
+    def get_logs(self, limit: int = 300) -> list[dict]:
+        """按时间倒序返回操作历史。"""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM operation_log ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [
+            {"id": r["id"], "ts": r["ts"], "action": r["action"],
+             "target": r["target"], "detail": r["detail"] or ""}
+            for r in rows
+        ]
+
+    def clear_logs(self) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM operation_log")

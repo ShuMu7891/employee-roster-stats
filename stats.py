@@ -36,6 +36,50 @@ def _bin_count(values: Iterable, bins: list[tuple[str, Callable]]) -> dict[str, 
     return result
 
 
+def _next_birthday(born: date, ref: date) -> tuple[date, int]:
+    """计算下一次生日日期与距今天数（生日当天为 0）。"""
+    next_dt = date(ref.year, born.month, born.day)
+    if next_dt < ref:
+        next_dt = date(ref.year + 1, born.month, born.day)
+    return next_dt, (next_dt - ref).days
+
+
+def compute_birthdays(employees: list[Employee], ref: date | None = None,
+                      within_days: int = 30) -> dict:
+    """生日统计：本月生日人数 + 未来 N 天内生日提醒列表。
+
+    只统计有合法生日的员工；2 月 29 日在非闰年按 2 月 28 日近似处理。
+    """
+    ref = ref or date.today()
+    month_count = 0
+    alerts = []
+    for e in employees:
+        born = Employee._parse(e.birth_date)
+        if born is None:
+            continue
+        if born.month == ref.month:
+            month_count += 1
+        # 处理 2 月 29 日在平年的近似
+        try:
+            next_dt, days = _next_birthday(born, ref)
+        except ValueError:
+            # 非闰年没有 2 月 29 日，按 2 月 28 日比较
+            approx = date(born.year, 2, 28)
+            next_dt, days = _next_birthday(approx, ref)
+        if days <= within_days:
+            age = e.age(ref)
+            alerts.append({
+                "name": e.name,
+                "department": e.department,
+                "birth_date": e.birth_date,
+                "next_date": next_dt.isoformat(),
+                "days": days,
+                "age": age + 1 if age is not None and days > 0 else age,
+            })
+    alerts.sort(key=lambda x: x["days"])
+    return {"this_month": month_count, "alerts": alerts, "within_days": within_days}
+
+
 def compute_stats(employees: list[Employee], ref: date | None = None) -> dict:
     """计算全部统计指标，返回可直接用于 UI 的字典。"""
     ref = ref or date.today()
@@ -81,6 +125,9 @@ def compute_stats(employees: list[Employee], ref: date | None = None) -> dict:
     contract_alerts.sort(key=lambda x: (x["status"] != "expired",
                                         x["remaining"] if x["remaining"] is not None else 0))
 
+    # 生日统计
+    birthday = compute_birthdays(employees, ref)
+
     return {
         "total": total,
         "gender": {
@@ -99,5 +146,6 @@ def compute_stats(employees: list[Employee], ref: date | None = None) -> dict:
         "edu_dist": dict(edu.most_common()),
         "contract": contract,
         "contract_alerts": contract_alerts,
+        "birthday": birthday,
         "ref_date": ref.isoformat(),
     }

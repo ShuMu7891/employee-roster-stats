@@ -20,12 +20,13 @@ from PySide6.QtWidgets import (
     QStackedWidget, QTableWidget, QTableWidgetItem, QHeaderView, QLineEdit,
     QDialog, QFormLayout, QComboBox, QCheckBox, QDateEdit, QTextEdit,
     QLabel, QMessageBox, QScrollArea, QFrame, QAbstractItemView, QFileDialog,
-    QSizePolicy
+    QSizePolicy, QInputDialog
 )
 
 from models import Employee, Database, GENDERS, EDUCATIONS
-from stats import compute_stats
+from stats import compute_stats, compute_birthdays
 from import_utils import parse_file, map_rows, SUPPORTED
+from export_utils import export_employees
 from glass_widgets import (
     GlassFrame, GlassButton, NavButton, StatCard, SectionTitle,
     DonutChart, BarChart, hline, COLORS, FONT, _with_alpha, rgba,
@@ -79,6 +80,56 @@ class ContractAlertItem(GlassFrame):
         lay.addLayout(info, 1)
 
         badge = QLabel(status_text)
+        badge.setFont(QFont(FONT, 12, QFont.Medium))
+        badge.setStyleSheet(
+            f"background:{rgba(accent, 42)}; color:{accent}; border-radius:9px; padding:4px 10px;"
+        )
+        lay.addWidget(badge)
+
+
+# --------------------------------------------------------------------------- #
+# 生日提醒条目
+# --------------------------------------------------------------------------- #
+class BirthdayAlertItem(GlassFrame):
+    """单条生日提醒卡片。"""
+
+    def __init__(self, alert: dict, parent=None):
+        super().__init__(parent, radius=16, alpha=165)
+        self.setFixedHeight(70)
+        days = alert["days"]
+        accent = COLORS["pink"] if days <= 7 else COLORS["purple"]
+        if days == 0:
+            days_text = "今天生日 🎉"
+        elif days == 1:
+            days_text = "明天生日"
+        else:
+            days_text = f"{days} 天后生日"
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(16, 8, 16, 8)
+        lay.setSpacing(12)
+
+        dot = QLabel("★")
+        dot.setFixedSize(34, 34)
+        dot.setAlignment(Qt.AlignCenter)
+        dot.setFont(QFont(FONT, 16, QFont.Bold))
+        dot.setStyleSheet(f"background:{rgba(accent, 40)}; color:{accent}; border-radius:11px;")
+        lay.addWidget(dot)
+
+        info = QVBoxLayout()
+        info.setSpacing(2)
+        name = QLabel(f"{alert['name']}　<span style='color:{COLORS['secondary']};font-size:12px;'>{alert['department']}</span>")
+        name.setFont(QFont(FONT, 14, QFont.Medium))
+        name.setStyleSheet(f"color:{COLORS['ink']};")
+        info.addWidget(name)
+        age_txt = f"将满 {alert['age']} 岁" if alert.get("age") is not None else ""
+        sub = QLabel(f"{alert['birth_date']} 出生 · {age_txt}")
+        sub.setFont(QFont(FONT, 12))
+        sub.setStyleSheet(f"color:{COLORS['secondary']};")
+        info.addWidget(sub)
+        lay.addLayout(info, 1)
+
+        badge = QLabel(days_text)
         badge.setFont(QFont(FONT, 12, QFont.Medium))
         badge.setStyleSheet(
             f"background:{rgba(accent, 42)}; color:{accent}; border-radius:9px; padding:4px 10px;"
@@ -170,11 +221,15 @@ class MainWindow(QMainWindow):
         self.nav_roster = NavButton("  员工花名册", "roster")
         self.nav_departed = NavButton("  已离职员工", "departed", accent=COLORS["secondary"])
         self.nav_contract = NavButton("  合同到期提醒", "contract")
+        self.nav_birthday = NavButton("  生日提醒", "birthday", accent=COLORS["pink"])
+        self.nav_history = NavButton("  操作历史", "history", accent=COLORS["purple"])
         self.nav_dash.setChecked(True)
         sb.addWidget(self.nav_dash)
         sb.addWidget(self.nav_roster)
         sb.addWidget(self.nav_departed)
         sb.addWidget(self.nav_contract)
+        sb.addWidget(self.nav_birthday)
+        sb.addWidget(self.nav_history)
         sb.addStretch(1)
 
         self.side_count = QLabel("")
@@ -182,6 +237,17 @@ class MainWindow(QMainWindow):
         self.side_count.setStyleSheet(f"color:{COLORS['secondary']};")
         self.side_count.setWordWrap(True)
         sb.addWidget(self.side_count)
+        sb.addSpacing(6)
+
+        # 备份 / 恢复
+        backup_row = QHBoxLayout()
+        backup_row.setSpacing(6)
+        self.backup_btn = GlassButton("备份")
+        self.restore_db_btn = GlassButton("恢复")
+        for b in (self.backup_btn, self.restore_db_btn):
+            b.setMinimumWidth(0)
+            backup_row.addWidget(b)
+        sb.addLayout(backup_row)
 
         tip = QLabel("双击表格行可编辑员工信息\n数据保存在本地 employees.db")
         tip.setFont(QFont(FONT, 11))
@@ -197,10 +263,14 @@ class MainWindow(QMainWindow):
         self.roster_page = self._build_roster()
         self.departed_page = self._build_departed()
         self.contract_page = self._build_contract()
+        self.birthday_page = self._build_birthday()
+        self.history_page = self._build_history()
         self.stack.addWidget(self.dash_page)
         self.stack.addWidget(self.roster_page)
         self.stack.addWidget(self.departed_page)
         self.stack.addWidget(self.contract_page)
+        self.stack.addWidget(self.birthday_page)
+        self.stack.addWidget(self.history_page)
         root.addWidget(self.stack)
 
     def _header(self, title: str, subtitle: str) -> QHBoxLayout:
@@ -217,8 +287,10 @@ class MainWindow(QMainWindow):
         outer.setSpacing(14)
 
         header = self._header("数据概览", "实时统计 · 数据随花名册自动更新")
+        self.export_btn_top = GlassButton("导出")
         self.import_btn_top = GlassButton("导入数据")
         self.add_btn_top = GlassButton("＋ 添加员工", primary=True)
+        header.addWidget(self.export_btn_top)
         header.addWidget(self.import_btn_top)
         header.addWidget(self.add_btn_top)
         outer.addLayout(header)
@@ -245,17 +317,18 @@ class MainWindow(QMainWindow):
         self.card_warning = StatCard("合同即将到期", "0", "时", COLORS["orange"])
         self.card_expired = StatCard("合同已过期", "0", "!", COLORS["pink"])
         self.card_departed = StatCard("已离职员工", "0", "离", COLORS["secondary"])
+        self.card_birthday = StatCard("本月生日", "0", "生", COLORS["pink"])
         self.all_cards = [
             self.card_total, self.card_male, self.card_female,
             self.card_cadre, self.card_age, self.card_tenure,
             self.card_dept, self.card_warning, self.card_expired,
-            self.card_departed,
+            self.card_departed, self.card_birthday,
         ]
-        for i, card in enumerate(self.all_cards):
-            if i < 9:
-                cards.addWidget(card, i // 3, i % 3)
-        # 第 10 张「已离职」卡片横跨整行，视觉更均衡
-        cards.addWidget(self.card_departed, 3, 0, 1, 3)
+        for i, card in enumerate(self.all_cards[:9]):
+            cards.addWidget(card, i // 3, i % 3)
+        # 第 4 行：已离职占 2 列，本月生日占 1 列
+        cards.addWidget(self.card_departed, 3, 0, 1, 2)
+        cards.addWidget(self.card_birthday, 3, 2)
         grid.addLayout(cards)
 
         # 图表行 1：性别 + 部门人数
@@ -313,6 +386,23 @@ class MainWindow(QMainWindow):
         af.addLayout(self.dash_alert_box)
         grid.addWidget(alert_frame)
 
+        # 生日提醒概览区
+        bday_frame = GlassFrame(radius=22, alpha=150)
+        bf = QVBoxLayout(bday_frame)
+        bf.setContentsMargins(18, 16, 18, 16)
+        bf.setSpacing(10)
+        bhead = QHBoxLayout()
+        bhead.addWidget(SectionTitle("近期生日", f"{WARN_DAYS} 天内过生日的员工"))
+        bhead.addStretch(1)
+        bmore = GlassButton("查看全部")
+        bmore.clicked.connect(lambda: self._switch_page("birthday"))
+        bhead.addWidget(bmore)
+        bf.addLayout(bhead)
+        self.dash_birthday_box = QVBoxLayout()
+        self.dash_birthday_box.setSpacing(8)
+        bf.addLayout(self.dash_birthday_box)
+        grid.addWidget(bday_frame)
+
         grid.addStretch(1)
         scroll.setWidget(container)
         outer.addWidget(scroll)
@@ -327,33 +417,26 @@ class MainWindow(QMainWindow):
 
         # 第一行：标题 + 操作按钮
         header = QHBoxLayout()
-        header.addWidget(SectionTitle("员工花名册", "双击行编辑 · 支持搜索与部门筛选"))
+        header.addWidget(SectionTitle("员工花名册", "双击行编辑 · 支持高级筛选与批量操作"))
         header.addStretch(1)
         self.import_btn = GlassButton("导入")
+        self.export_btn = GlassButton("导出")
         self.add_btn = GlassButton("＋ 添加", primary=True)
         self.edit_btn = GlassButton("编辑")
         self.depart_btn = GlassButton("办理离职", accent=COLORS["orange"])
         self.del_btn = GlassButton("删除")
-        for btn in (self.import_btn, self.add_btn, self.edit_btn, self.depart_btn, self.del_btn):
+        for btn in (self.import_btn, self.export_btn, self.add_btn, self.edit_btn,
+                    self.depart_btn, self.del_btn):
             header.addWidget(btn)
         lay.addLayout(header)
 
-        # 第二行：筛选控件 + 计数
+        # 第二行：搜索 + 基础筛选 + 计数
         filter_row = QHBoxLayout()
-        filter_row.setSpacing(10)
-        self.dept_filter = QComboBox()
-        self.dept_filter.setFixedHeight(40)
-        self.dept_filter.setFixedWidth(150)
-        self.dept_filter.setStyleSheet(f"""
-            QComboBox {{ background:rgba(255,255,255,0.6);
-            border:1px solid rgba(255,255,255,0.85); border-radius:13px;
-            padding:0 12px; color:{COLORS['ink']}; font-size:14px; font-family:{FONT}; }}
-        """)
-        filter_row.addWidget(self.dept_filter)
+        filter_row.setSpacing(8)
         self.search = QLineEdit()
         self.search.setPlaceholderText("🔍 搜索姓名 / 部门 / 职位 / 电话 / 学历")
         self.search.setFixedHeight(40)
-        self.search.setMinimumWidth(280)
+        self.search.setMinimumWidth(240)
         self.search.setStyleSheet(f"""
             QLineEdit {{
                 background: rgba(255,255,255,0.6);
@@ -364,11 +447,61 @@ class MainWindow(QMainWindow):
             }}
         """)
         filter_row.addWidget(self.search, 1)
+        self.dept_filter = QComboBox()
+        self.dept_filter.setFixedHeight(40)
+        self.dept_filter.setFixedWidth(120)
+        filter_row.addWidget(self.dept_filter)
         self.count_label = QLabel("")
         self.count_label.setFont(QFont(FONT, 12))
         self.count_label.setStyleSheet(f"color:{COLORS['secondary']};")
         filter_row.addWidget(self.count_label)
         lay.addLayout(filter_row)
+
+        # 第三行：高级组合筛选
+        adv_row = QHBoxLayout()
+        adv_row.setSpacing(8)
+        adv_label = QLabel("高级筛选")
+        adv_label.setFont(QFont(FONT, 12, QFont.Medium))
+        adv_label.setStyleSheet(f"color:{COLORS['secondary']};")
+        adv_row.addWidget(adv_label)
+        combo_style = f"""
+            QComboBox {{ background:rgba(255,255,255,0.55);
+            border:1px solid rgba(255,255,255,0.8); border-radius:11px;
+            padding:0 10px; color:{COLORS['ink']}; font-size:13px; font-family:{FONT}; }}
+        """
+        self.edu_filter = QComboBox(); self.edu_filter.setFixedHeight(36); self.edu_filter.setFixedWidth(110)
+        self.edu_filter.setStyleSheet(combo_style)
+        self.edu_filter.addItem("全部学历")
+        self.edu_filter.addItems(list(EDUCATIONS))
+        self.cadre_filter = QComboBox(); self.cadre_filter.setFixedHeight(36); self.cadre_filter.setFixedWidth(100)
+        self.cadre_filter.setStyleSheet(combo_style)
+        self.cadre_filter.addItems(["全部干部", "仅干部", "非干部"])
+        self.age_filter = QComboBox(); self.age_filter.setFixedHeight(36); self.age_filter.setFixedWidth(110)
+        self.age_filter.setStyleSheet(combo_style)
+        self.age_filter.addItems(["全部年龄", "25岁以下", "25-30岁", "31-35岁", "36-40岁", "41-50岁", "50岁以上"])
+        self.tenure_filter = QComboBox(); self.tenure_filter.setFixedHeight(36); self.tenure_filter.setFixedWidth(110)
+        self.tenure_filter.setStyleSheet(combo_style)
+        self.tenure_filter.addItems(["全部工龄", "1年以下", "1-3年", "3-5年", "5-10年", "10年以上"])
+        for combo in (self.edu_filter, self.cadre_filter, self.age_filter, self.tenure_filter):
+            adv_row.addWidget(combo)
+        self.reset_filter_btn = GlassButton("重置筛选")
+        adv_row.addWidget(self.reset_filter_btn)
+        adv_row.addStretch(1)
+        lay.addLayout(adv_row)
+
+        # 第四行：批量操作提示 + 按钮
+        batch_row = QHBoxLayout()
+        batch_row.setSpacing(8)
+        batch_hint = QLabel("多选行（Ctrl / Shift 点击）可批量操作：")
+        batch_hint.setFont(QFont(FONT, 12))
+        batch_hint.setStyleSheet(f"color:{COLORS['secondary']};")
+        batch_row.addWidget(batch_hint)
+        self.batch_dept_btn = GlassButton("批量调部门")
+        self.batch_del_btn = GlassButton("批量删除", accent=COLORS["pink"])
+        batch_row.addWidget(self.batch_dept_btn)
+        batch_row.addWidget(self.batch_del_btn)
+        batch_row.addStretch(1)
+        lay.addLayout(batch_row)
 
         table_frame = GlassFrame(radius=22, alpha=160)
         tf = QVBoxLayout(table_frame)
@@ -396,6 +529,7 @@ class MainWindow(QMainWindow):
         """)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.verticalHeader().setVisible(False)
         self.table.setShowGrid(True)
         hh = self.table.horizontalHeader()
@@ -500,26 +634,113 @@ class MainWindow(QMainWindow):
         lay.addWidget(scroll, 1)
         return page
 
+    def _build_birthday(self) -> QWidget:
+        """生日提醒页面。"""
+        page = QWidget()
+        page.setStyleSheet("background: transparent;")
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(6, 4, 6, 4)
+        lay.setSpacing(14)
+
+        header = self._header("生日提醒", "本月寿星与近期生日一览")
+        lay.addLayout(header)
+
+        self.birthday_summary = QLabel("")
+        self.birthday_summary.setFont(QFont(FONT, 14, QFont.Medium))
+        self.birthday_summary.setStyleSheet(f"color:{COLORS['ink']};")
+        lay.addWidget(self.birthday_summary)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea{background:transparent;border:none;}")
+        container = QWidget()
+        container.setStyleSheet("background:transparent;")
+        self.birthday_box = QVBoxLayout(container)
+        self.birthday_box.setContentsMargins(2, 2, 8, 2)
+        self.birthday_box.setSpacing(10)
+        self.birthday_box.setAlignment(Qt.AlignTop)
+        scroll.setWidget(container)
+        lay.addWidget(scroll, 1)
+        return page
+
+    def _build_history(self) -> QWidget:
+        """操作历史页面。"""
+        page = QWidget()
+        page.setStyleSheet("background: transparent;")
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(6, 4, 6, 4)
+        lay.setSpacing(14)
+
+        header = QHBoxLayout()
+        header.addWidget(SectionTitle("操作历史", "所有数据变更自动留痕"))
+        header.addStretch(1)
+        self.clear_logs_btn = GlassButton("清空历史", accent=COLORS["pink"])
+        header.addWidget(self.clear_logs_btn)
+        lay.addLayout(header)
+
+        table_frame = GlassFrame(radius=22, alpha=160)
+        tf = QVBoxLayout(table_frame)
+        tf.setContentsMargins(14, 14, 14, 14)
+        self.history_table = QTableWidget()
+        self.history_table.setColumnCount(4)
+        self.history_table.setHorizontalHeaderLabels(["时间", "操作", "对象", "详情"])
+        self.history_table.setStyleSheet(f"""
+            QTableWidget {{
+                background: transparent; border: none;
+                color: {COLORS['ink']}; font-size: 13px; font-family: {FONT};
+                gridline-color: rgba(120,120,128,0.12);
+            }}
+            QHeaderView::section {{
+                background: rgba(255,255,255,0.5); color: {COLORS['ink']};
+                font-weight: bold; font-size: 13px; border: none;
+                border-bottom: 1px solid rgba(120,120,128,0.2); padding: 8px 4px;
+            }}
+            QTableWidget::item {{ padding: 6px 4px; }}
+        """)
+        self.history_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.history_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.history_table.verticalHeader().setVisible(False)
+        hh = self.history_table.horizontalHeader()
+        hh.setSectionResizeMode(QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(3, QHeaderView.Stretch)
+        self.history_table.verticalHeader().setDefaultSectionSize(36)
+        tf.addWidget(self.history_table)
+        lay.addWidget(table_frame, 1)
+        return page
+
     # ---------- 信号绑定 ----------
     def _bind(self):
-        for nav in (self.nav_dash, self.nav_roster, self.nav_departed, self.nav_contract):
+        for nav in (self.nav_dash, self.nav_roster, self.nav_departed,
+                    self.nav_contract, self.nav_birthday, self.nav_history):
             nav.checkedSignal.connect(self._switch_page)
         self.add_btn.clicked.connect(self._on_add)
         self.add_btn_top.clicked.connect(self._on_add)
         self.import_btn.clicked.connect(self._on_import)
         self.import_btn_top.clicked.connect(self._on_import)
+        self.export_btn.clicked.connect(self._on_export)
+        self.export_btn_top.clicked.connect(self._on_export)
         self.edit_btn.clicked.connect(self._on_edit)
         self.depart_btn.clicked.connect(self._on_depart)
         self.restore_btn.clicked.connect(self._on_restore)
         self.del_btn.clicked.connect(self._on_delete)
+        self.batch_del_btn.clicked.connect(self._on_batch_delete)
+        self.batch_dept_btn.clicked.connect(self._on_batch_department)
+        self.reset_filter_btn.clicked.connect(self._on_reset_filter)
+        self.backup_btn.clicked.connect(self._on_backup)
+        self.restore_db_btn.clicked.connect(self._on_restore_db)
+        self.clear_logs_btn.clicked.connect(self._on_clear_logs)
         self.search.textChanged.connect(self._on_search)
         self.dept_filter.currentTextChanged.connect(self._on_search)
+        for combo in (self.edu_filter, self.cadre_filter, self.age_filter, self.tenure_filter):
+            combo.currentTextChanged.connect(self._on_search)
 
     def _switch_page(self, key: str):
-        for nav in (self.nav_dash, self.nav_roster, self.nav_departed, self.nav_contract):
+        for nav in (self.nav_dash, self.nav_roster, self.nav_departed,
+                    self.nav_contract, self.nav_birthday, self.nav_history):
             nav.setChecked(nav.key == key)
         pages = {"dashboard": self.dash_page, "roster": self.roster_page,
-                 "departed": self.departed_page, "contract": self.contract_page}
+                 "departed": self.departed_page, "contract": self.contract_page,
+                 "birthday": self.birthday_page, "history": self.history_page}
         self.stack.setCurrentWidget(pages[key])
         if key == "dashboard":
             self.refresh_dashboard()
@@ -527,8 +748,12 @@ class MainWindow(QMainWindow):
             self.refresh_table()
         elif key == "departed":
             self.refresh_departed()
-        else:
+        elif key == "contract":
             self.refresh_contract()
+        elif key == "birthday":
+            self.refresh_birthday()
+        else:
+            self.refresh_history()
 
     # ---------- 数据刷新 ----------
     def refresh_all(self):
@@ -536,6 +761,8 @@ class MainWindow(QMainWindow):
         self.refresh_table()
         self.refresh_departed()
         self.refresh_contract()
+        self.refresh_birthday()
+        self.refresh_history()
         self._refresh_dept_filter()
 
     def _clear_layout(self, layout):
@@ -543,6 +770,7 @@ class MainWindow(QMainWindow):
             item = layout.takeAt(0)
             widget = item.widget()
             if widget:
+                widget.setParent(None)
                 widget.deleteLater()
 
     def refresh_dashboard(self):
@@ -560,6 +788,7 @@ class MainWindow(QMainWindow):
         self.card_warning.set_value(stats["contract"]["warning"])
         self.card_expired.set_value(stats["contract"]["expired"])
         self.card_departed.set_value(departed_count)
+        self.card_birthday.set_value(stats["birthday"]["this_month"])
 
         self.donut.set_data([
             ("男", stats["gender"]["男"], COLORS["teal"]),
@@ -588,6 +817,18 @@ class MainWindow(QMainWindow):
             f"部门 {len(stats['dept_detail'])} 个 · 合同提醒 {c['expired'] + c['warning']} 条"
         )
 
+        # 生日概览（最多 4 条）
+        self._clear_layout(self.dash_birthday_box)
+        b_alerts = stats["birthday"]["alerts"][:4]
+        if b_alerts:
+            for b in b_alerts:
+                self.dash_birthday_box.addWidget(BirthdayAlertItem(b))
+        else:
+            empty = QLabel("近期没有员工过生日")
+            empty.setFont(QFont(FONT, 13))
+            empty.setStyleSheet(f"color:{COLORS['secondary']}; padding:14px;")
+            self.dash_birthday_box.addWidget(empty)
+
     def refresh_contract(self):
         active = [e for e in self.db.get_all() if not e.is_departed]
         stats = compute_stats(active)
@@ -611,6 +852,41 @@ class MainWindow(QMainWindow):
             label.setStyleSheet(f"color:{COLORS['secondary']}; padding:40px;")
             el.addWidget(label)
             self.contract_box.addWidget(empty)
+
+    def refresh_birthday(self):
+        active = [e for e in self.db.get_all() if not e.is_departed]
+        b = compute_birthdays(active, date.today(), WARN_DAYS)
+        self.birthday_summary.setText(
+            f"本月寿星 {b['this_month']} 人　·　未来 {WARN_DAYS} 天内过生日 {len(b['alerts'])} 人"
+        )
+        self._clear_layout(self.birthday_box)
+        if b["alerts"]:
+            for item in b["alerts"]:
+                self.birthday_box.addWidget(BirthdayAlertItem(item))
+            self.birthday_box.addStretch(1)
+        else:
+            empty = GlassFrame(radius=20, alpha=150)
+            el = QVBoxLayout(empty)
+            label = QLabel("🎂 近期没有员工过生日")
+            label.setFont(QFont(FONT, 16))
+            label.setAlignment(Qt.AlignCenter)
+            label.setStyleSheet(f"color:{COLORS['secondary']}; padding:40px;")
+            el.addWidget(label)
+            self.birthday_box.addWidget(empty)
+
+    def refresh_history(self):
+        logs = self.db.get_logs()
+        self.history_table.setRowCount(len(logs))
+        for r, log in enumerate(logs):
+            values = [log["ts"], log["action"], log["target"], log["detail"]]
+            for c, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+                if c == 0:
+                    item.setForeground(QColor(COLORS["secondary"]))
+                elif c == 1:
+                    item.setFont(QFont(FONT, 12, QFont.Medium))
+                self.history_table.setItem(r, c, item)
 
     def refresh_departed(self):
         """刷新已离职员工列表。"""
@@ -648,10 +924,41 @@ class MainWindow(QMainWindow):
         keyword = self.search.text().strip()
         department = self.dept_filter.currentText()
         employees = self.db.search(keyword, department, departed=False)
+
+        # 高级组合筛选
+        edu = self.edu_filter.currentText()
+        cadre = self.cadre_filter.currentText()
+        age_bin = self.age_filter.currentText()
+        tenure_bin = self.tenure_filter.currentText()
+        from stats import AGE_BINS, TENURE_BINS
+
+        def in_bin(value, bin_name, bins):
+            if bin_name == "全部年龄" or bin_name == "全部工龄" or value is None:
+                return bin_name.startswith("全部")
+            for name, pred in bins:
+                if name == bin_name:
+                    return pred(value)
+            return True
+
+        ref = date.today()
+        filtered = []
+        for e in employees:
+            if edu != "全部学历" and e.education != edu:
+                continue
+            if cadre == "仅干部" and not e.is_cadre:
+                continue
+            if cadre == "非干部" and e.is_cadre:
+                continue
+            if not in_bin(e.age(ref), age_bin, AGE_BINS):
+                continue
+            if not in_bin(e.tenure(ref), tenure_bin, TENURE_BINS):
+                continue
+            filtered.append(e)
+        employees = filtered
+
         active_total = sum(1 for e in self.db.get_all() if not e.is_departed)
         self.table.setRowCount(len(employees))
-        self.count_label.setText(f"在职 {len(employees)} / {active_total} 人")
-        ref = date.today()
+        self.count_label.setText(f"筛选 {len(employees)} / 在职 {active_total} 人")
         for r, e in enumerate(employees):
             age = e.age(ref)
             tenure = e.tenure(ref)
@@ -704,7 +1011,9 @@ class MainWindow(QMainWindow):
     def _on_add(self):
         dialog = EmployeeDialog(self)
         if dialog.exec() == QDialog.Accepted:
-            self.db.add(dialog.employee())
+            emp = dialog.employee()
+            self.db.add(emp)
+            self.db.add_log("添加", emp.name, f"{emp.department} / {emp.position}")
             self.refresh_all()
             self._toast("已添加员工，统计已自动更新")
 
@@ -718,6 +1027,7 @@ class MainWindow(QMainWindow):
             updated = dialog.employee()
             updated.id = emp.id
             self.db.update(updated)
+            self.db.add_log("编辑", updated.name, f"更新员工信息")
             self.refresh_all()
             self._toast("已更新员工信息")
 
@@ -732,6 +1042,7 @@ class MainWindow(QMainWindow):
         )
         if reply == QMessageBox.Yes:
             self.db.delete(emp.id)
+            self.db.add_log("删除", emp.name, f"{emp.department} / {emp.position}")
             self.refresh_all()
             self._toast("已删除员工")
 
@@ -750,7 +1061,9 @@ class MainWindow(QMainWindow):
             return
         dialog = DepartDateDialog(self, emp.name)
         if dialog.exec() == QDialog.Accepted:
-            self.db.set_departed(emp.id, True, dialog.leave_date())
+            leave = dialog.leave_date()
+            self.db.set_departed(emp.id, True, leave)
+            self.db.add_log("办理离职", emp.name, f"离职日期 {leave}")
             self.refresh_all()
             self._toast(f"已办理 {emp.name} 的离职手续")
 
@@ -771,14 +1084,150 @@ class MainWindow(QMainWindow):
         )
         if reply == QMessageBox.Yes:
             self.db.set_departed(emp.id, False)
+            self.db.add_log("恢复在职", emp.name, "重新恢复为在职员工")
             self.refresh_all()
             self._toast(f"已将 {emp.name} 恢复为在职")
 
     def _on_import(self):
         dialog = ImportDialog(self, self.db)
         if dialog.exec() == QDialog.Accepted and dialog.imported_count:
+            self.db.add_log("导入", "花名册", f"批量导入 {dialog.imported_count} 名员工")
             self.refresh_all()
             self._toast(f"成功导入 {dialog.imported_count} 名员工")
+
+    def _on_export(self):
+        """导出当前花名册（含筛选结果）到 xlsx / csv。"""
+        from export_utils import export_employees
+        keyword = self.search.text().strip()
+        department = self.dept_filter.currentText()
+        employees = self.db.search(keyword, department, departed=False)
+        # 与表格保持一致的筛选
+        edu = self.edu_filter.currentText()
+        cadre = self.cadre_filter.currentText()
+        if edu != "全部学历":
+            employees = [e for e in employees if e.education == edu]
+        if cadre == "仅干部":
+            employees = [e for e in employees if e.is_cadre]
+        elif cadre == "非干部":
+            employees = [e for e in employees if not e.is_cadre]
+        if not employees:
+            QMessageBox.information(self, "提示", "当前没有可导出的员工数据")
+            return
+        path, selected = QFileDialog.getSaveFileName(
+            self, "导出花名册", "员工花名册.xlsx",
+            "Excel 表格 (*.xlsx);;CSV 文件 (*.csv)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith((".xlsx", ".csv")):
+            path += ".xlsx" if "xlsx" in selected else ".csv"
+        try:
+            export_employees(employees, path)
+            self.db.add_log("导出", "花名册", f"导出 {len(employees)} 人至 {Path(path).name}")
+            self._toast(f"已导出 {len(employees)} 人至 {Path(path).name}")
+        except Exception as exc:
+            QMessageBox.warning(self, "导出失败", str(exc))
+
+    def _on_reset_filter(self):
+        self.search.clear()
+        self.dept_filter.setCurrentIndex(0)
+        self.edu_filter.setCurrentIndex(0)
+        self.cadre_filter.setCurrentIndex(0)
+        self.age_filter.setCurrentIndex(0)
+        self.tenure_filter.setCurrentIndex(0)
+        self.refresh_table()
+
+    def _selected_ids(self, table=None) -> list[int]:
+        table = table or self.table
+        ids = []
+        for idx in table.selectionModel().selectedRows():
+            cell = table.item(idx.row(), 0)
+            if cell:
+                try:
+                    ids.append(int(cell.text()))
+                except ValueError:
+                    pass
+        return ids
+
+    def _on_batch_delete(self):
+        ids = self._selected_ids()
+        if not ids:
+            QMessageBox.information(self, "提示", "请先选中要删除的员工（可多选）")
+            return
+        reply = QMessageBox.question(
+            self, "批量删除", f"确定删除选中的 {len(ids)} 名员工吗？此操作不可撤销。",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            n = self.db.delete_many(ids)
+            self.db.add_log("批量删除", f"{n} 名员工", f"删除 ID: {ids}")
+            self.refresh_all()
+            self._toast(f"已删除 {n} 名员工")
+
+    def _on_batch_department(self):
+        ids = self._selected_ids()
+        if not ids:
+            QMessageBox.information(self, "提示", "请先选中要调整的员工（可多选）")
+            return
+        departments = self.db.get_departments()
+        dept, ok = QInputDialog.getItem(
+            self, "批量调部门", "选择目标部门：", departments, 0, True,
+        )
+        if not ok or not dept:
+            return
+        n = self.db.set_department_many(ids, dept)
+        self.db.add_log("批量调部门", f"{n} 名员工", f"调整为 {dept}")
+        self.refresh_all()
+        self._toast(f"已将 {n} 名员工调整为 {dept}")
+
+    def _on_backup(self):
+        """备份数据库到用户指定位置。"""
+        from shutil import copy2
+        default = f"员工花名册备份_{date.today().isoformat()}.db"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "备份数据", default, "数据库文件 (*.db)",
+        )
+        if not path:
+            return
+        try:
+            copy2(self.db.path, path)
+            self.db.add_log("备份", "数据库", Path(path).name)
+            self._toast(f"已备份到 {Path(path).name}")
+        except Exception as exc:
+            QMessageBox.warning(self, "备份失败", str(exc))
+
+    def _on_restore_db(self):
+        """从备份文件恢复数据库。"""
+        from shutil import copy2
+        path, _ = QFileDialog.getOpenFileName(
+            self, "恢复数据", "", "数据库文件 (*.db)",
+        )
+        if not path:
+            return
+        reply = QMessageBox.warning(
+            self, "确认恢复",
+            "恢复将覆盖当前所有数据，确定继续吗？\n建议先备份当前数据。",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            copy2(path, self.db.path)
+            self.db.add_log("恢复", "数据库", Path(path).name)
+            self.refresh_all()
+            self._toast("数据已恢复")
+        except Exception as exc:
+            QMessageBox.warning(self, "恢复失败", str(exc))
+
+    def _on_clear_logs(self):
+        reply = QMessageBox.question(
+            self, "清空历史", "确定清空所有操作历史吗？此操作不可撤销。",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            self.db.clear_logs()
+            self.refresh_history()
+            self._toast("操作历史已清空")
 
     def _toast(self, message: str):
         if hasattr(self, "statusBar"):
